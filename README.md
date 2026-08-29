@@ -40,8 +40,10 @@ dnf install -y iproute-tc git
 一键安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/asd307769162/vps-tc-limit/main/vps-tc-limit -o /tmp/vps-tc-limit && chmod +x /tmp/vps-tc-limit && sudo /tmp/vps-tc-limit install
+curl -fsSL "https://raw.githubusercontent.com/asd307769162/vps-tc-limit/main/vps-tc-limit?t=$(date +%s)" -o /tmp/vps-tc-limit && chmod +x /tmp/vps-tc-limit && sudo /tmp/vps-tc-limit install
 ```
+
+URL 后面的时间戳用于避开 GitHub Raw/CDN 缓存，确保升级时下载到最新版本。安装后可用 `vps-tc-limit --version` 核对实际版本。
 
 或者克隆仓库安装：
 

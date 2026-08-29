@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 readonly PROGRAM_NAME="vps-tc-limit"
-readonly PROGRAM_VERSION="1.2.0"
+readonly PROGRAM_VERSION="1.2.1"
 readonly CONFIG_FILE="${VPS_TC_CONFIG:-/etc/vps-tc-limit.conf}"
 readonly SERVICE_FILE="/etc/systemd/system/vps-tc-limit.service"
 readonly INSTALL_PATH="/usr/local/sbin/vps-tc-limit"
@@ -249,7 +249,7 @@ UNIT
   systemctl daemon-reload
   systemctl enable vps-tc-limit.service
   detected=$(detect_interface) || detected=""
-  log "安装完成，已设置为开机自动启动。"
+  log "v$PROGRAM_VERSION 安装完成，已设置为开机自动启动。"
   [[ -n $detected ]] && log "自动识别到默认出口网卡：$detected"
 
   if [[ -t 0 && -t 1 ]]; then
@@ -309,9 +309,9 @@ EOF
 interactive_menu() {
   local choice
   while true; do
-    cat <<'MENU'
+    cat <<MENU
 
-VPS TC 一键限速
+VPS TC 一键限速 v$PROGRAM_VERSION
 1) 启动限速
 2) 关闭限速
 3) 重启限速
