@@ -36,6 +36,14 @@ dnf install -y iproute-tc git
 
 ## 安装
 
+一键安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/asd307769162/vps-tc-limit/main/vps-tc-limit -o /tmp/vps-tc-limit && chmod +x /tmp/vps-tc-limit && sudo /tmp/vps-tc-limit install
+```
+
+或者克隆仓库安装：
+
 ```bash
 git clone https://github.com/asd307769162/vps-tc-limit.git
 cd vps-tc-limit
