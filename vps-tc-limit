@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 readonly PROGRAM_NAME="vps-tc-limit"
-readonly PROGRAM_VERSION="1.1.0"
+readonly PROGRAM_VERSION="1.2.0"
 readonly CONFIG_FILE="${VPS_TC_CONFIG:-/etc/vps-tc-limit.conf}"
 readonly SERVICE_FILE="/etc/systemd/system/vps-tc-limit.service"
 readonly INSTALL_PATH="/usr/local/sbin/vps-tc-limit"
@@ -46,6 +46,10 @@ valid_interface() {
 
 valid_rate() {
   [[ ${1,,} =~ ^[0-9]+([.][0-9]+)?(kbit|mbit|gbit)$ ]]
+}
+
+valid_rate_number() {
+  [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]] && [[ ! $1 =~ ^0+([.]0+)?$ ]]
 }
 
 valid_burst() {
@@ -140,7 +144,7 @@ configure() {
   require_root
   require_command tc
   require_command ip
-  local detected interface rate burst latency answer advanced old_interface=""
+  local detected interface rate rate_number burst latency answer advanced old_interface=""
   local current_rate=$DEFAULT_RATE current_burst=$DEFAULT_BURST current_latency=$DEFAULT_LATENCY
   if [[ -f $CONFIG_FILE ]]; then
     load_config
@@ -151,6 +155,14 @@ configure() {
   fi
   detected=$(detect_interface) || detected=""
 
+  if [[ ${current_rate,,} == *mbit ]]; then
+    rate_number=${current_rate,,}
+    rate_number=${rate_number%mbit}
+  else
+    rate_number=15
+    warn "现有配置 $current_rate 不是 Mbit 单位，本次设置界面默认显示 15 Mbit/s。"
+  fi
+
   if [[ -n $detected ]]; then
     interface=auto
     printf '已自动识别默认出口网卡：%s\n' "$detected"
@@ -160,13 +172,14 @@ configure() {
     valid_interface "$interface" || die "Invalid or missing interface: $interface"
   fi
 
-  read -r -p "请输入出站限速值 [$current_rate]（例如 15mbit）：" rate
-  rate=${rate:-$current_rate}
-  valid_rate "$rate" || die "限速格式错误，请使用 15000kbit、15mbit 或 1gbit。"
+  read -r -p "请输入出站限速数值，单位 Mbit/s [默认 $rate_number，直接回车采用默认值]：" rate
+  rate=${rate:-$rate_number}
+  valid_rate_number "$rate" || die "限速值只能填写大于 0 的数字，例如 15 或 15.5，不要填写 mbit。"
+  rate="${rate}mbit"
 
   burst=$current_burst
   latency=$current_latency
-  read -r -p "是否修改高级参数 burst/latency？[y/N]：" advanced
+  read -r -p "是否修改高级参数 burst/latency？[y/N，直接回车默认 N]：" advanced
   if [[ $advanced =~ ^[Yy]$ ]]; then
     read -r -p "Burst [$current_burst]：" burst
     burst=${burst:-$current_burst}
@@ -178,7 +191,7 @@ configure() {
   fi
 
   write_config "$interface" "${rate,,}" "${burst,,}" "${latency,,}"
-  read -r -p "是否立即应用新的限速设置？[Y/n]：" answer
+  read -r -p "是否立即应用新的限速设置？[Y/n，直接回车默认 Y]：" answer
   if [[ ! $answer =~ ^[Nn]$ ]]; then
     if [[ -n $old_interface ]] && tc qdisc show dev "$old_interface" 2>/dev/null | grep -qE '^qdisc tbf .* root'; then
       tc qdisc del dev "$old_interface" root
@@ -245,7 +258,7 @@ UNIT
       configure
     else
       local setup_answer
-      read -r -p "是否现在重新设置限速值？[y/N]：" setup_answer
+      read -r -p "是否现在重新设置限速值？[y/N，直接回车默认 N]：" setup_answer
       if [[ $setup_answer =~ ^[Yy]$ ]]; then
         configure
       else
