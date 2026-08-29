@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 readonly PROGRAM_NAME="vps-tc-limit"
-readonly PROGRAM_VERSION="1.0.0"
+readonly PROGRAM_VERSION="1.1.0"
 readonly CONFIG_FILE="${VPS_TC_CONFIG:-/etc/vps-tc-limit.conf}"
 readonly SERVICE_FILE="/etc/systemd/system/vps-tc-limit.service"
 readonly INSTALL_PATH="/usr/local/sbin/vps-tc-limit"
@@ -140,36 +140,45 @@ configure() {
   require_root
   require_command tc
   require_command ip
-  local detected interface rate burst latency answer old_interface=""
+  local detected interface rate burst latency answer advanced old_interface=""
+  local current_rate=$DEFAULT_RATE current_burst=$DEFAULT_BURST current_latency=$DEFAULT_LATENCY
   if [[ -f $CONFIG_FILE ]]; then
     load_config
     old_interface=$INTERFACE
+    current_rate=$RATE
+    current_burst=$BURST
+    current_latency=$LATENCY
   fi
   detected=$(detect_interface) || detected=""
 
-  printf 'Detected default interface: %s\n' "${detected:-not found}"
-  read -r -p "Interface [auto]: " interface
-  interface=${interface:-auto}
-  if [[ $interface != auto ]]; then
+  if [[ -n $detected ]]; then
+    interface=auto
+    printf '已自动识别默认出口网卡：%s\n' "$detected"
+  else
+    warn "自动识别默认出口网卡失败。"
+    read -r -p "请输入网卡名称（例如 eth0 或 ens3）：" interface
     valid_interface "$interface" || die "Invalid or missing interface: $interface"
-  elif [[ -z $detected ]]; then
-    die "Automatic detection failed; specify an interface."
   fi
 
-  read -r -p "Outbound rate [15mbit]: " rate
-  rate=${rate:-15mbit}
-  valid_rate "$rate" || die "Use a value such as 15000kbit, 15mbit, or 1gbit."
+  read -r -p "请输入出站限速值 [$current_rate]（例如 15mbit）：" rate
+  rate=${rate:-$current_rate}
+  valid_rate "$rate" || die "限速格式错误，请使用 15000kbit、15mbit 或 1gbit。"
 
-  read -r -p "Burst [32kb]: " burst
-  burst=${burst:-32kb}
-  valid_burst "$burst" || die "Use a value such as 32kb or 1mb."
+  burst=$current_burst
+  latency=$current_latency
+  read -r -p "是否修改高级参数 burst/latency？[y/N]：" advanced
+  if [[ $advanced =~ ^[Yy]$ ]]; then
+    read -r -p "Burst [$current_burst]：" burst
+    burst=${burst:-$current_burst}
+    valid_burst "$burst" || die "Burst 格式错误，请使用 32kb 或 1mb。"
 
-  read -r -p "Queue latency [400ms]: " latency
-  latency=${latency:-400ms}
-  valid_latency "$latency" || die "Use a value such as 400ms or 1s."
+    read -r -p "最大排队延迟 [$current_latency]：" latency
+    latency=${latency:-$current_latency}
+    valid_latency "$latency" || die "延迟格式错误，请使用 400ms 或 1s。"
+  fi
 
   write_config "$interface" "${rate,,}" "${burst,,}" "${latency,,}"
-  read -r -p "Apply the new limit now? [Y/n]: " answer
+  read -r -p "是否立即应用新的限速设置？[Y/n]：" answer
   if [[ ! $answer =~ ^[Nn]$ ]]; then
     if [[ -n $old_interface ]] && tc qdisc show dev "$old_interface" 2>/dev/null | grep -qE '^qdisc tbf .* root'; then
       tc qdisc del dev "$old_interface" root
@@ -197,12 +206,13 @@ install_service() {
   require_command ip
   require_command tc
 
+  local first_install=0 tmp detected
   install -o root -g root -m 755 "$0" "$INSTALL_PATH"
   if [[ ! -f $CONFIG_FILE ]]; then
     write_config "$DEFAULT_INTERFACE" "$DEFAULT_RATE" "$DEFAULT_BURST" "$DEFAULT_LATENCY"
+    first_install=1
   fi
 
-  local tmp
   tmp=$(mktemp)
   chmod 600 "$tmp"
   cat > "$tmp" <<'UNIT'
@@ -225,8 +235,27 @@ UNIT
   rm -f "$tmp"
   systemctl daemon-reload
   systemctl enable vps-tc-limit.service
-  log "Installed and enabled for boot. Run '$INSTALL_PATH configure' to change the rate."
-  systemctl restart vps-tc-limit.service
+  detected=$(detect_interface) || detected=""
+  log "安装完成，已设置为开机自动启动。"
+  [[ -n $detected ]] && log "自动识别到默认出口网卡：$detected"
+
+  if [[ -t 0 && -t 1 ]]; then
+    if [[ $first_install -eq 1 ]]; then
+      printf '\n首次安装设置向导\n'
+      configure
+    else
+      local setup_answer
+      read -r -p "是否现在重新设置限速值？[y/N]：" setup_answer
+      if [[ $setup_answer =~ ^[Yy]$ ]]; then
+        configure
+      else
+        systemctl restart vps-tc-limit.service
+      fi
+    fi
+  else
+    systemctl restart vps-tc-limit.service
+    log "非交互环境使用默认或现有配置；运行 '$INSTALL_PATH configure' 可修改限速。"
+  fi
 }
 
 uninstall_service() {
@@ -269,17 +298,17 @@ interactive_menu() {
   while true; do
     cat <<'MENU'
 
-VPS TC Limit
-1) Start limit
-2) Stop limit
-3) Restart limit
-4) Set limit speed
-5) Show status
-6) Install/enable at boot
-7) Uninstall service
-0) Exit
+VPS TC 一键限速
+1) 启动限速
+2) 关闭限速
+3) 重启限速
+4) 设置限制速度
+5) 查看状态
+6) 安装并设置开机启动
+7) 卸载服务
+0) 退出
 MENU
-    read -r -p "Select: " choice
+    read -r -p "请选择：" choice
     case $choice in
       1) start_limit ;;
       2) stop_limit ;;
@@ -289,7 +318,7 @@ MENU
       6) install_service ;;
       7) uninstall_service ;;
       0) return 0 ;;
-      *) warn "Invalid selection." ;;
+      *) warn "无效选项。" ;;
     esac
   done
 }
