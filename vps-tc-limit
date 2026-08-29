@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly PROGRAM_NAME="vps-tc-limit"
+readonly PROGRAM_VERSION="1.0.0"
+readonly CONFIG_FILE="${VPS_TC_CONFIG:-/etc/vps-tc-limit.conf}"
+readonly SERVICE_FILE="/etc/systemd/system/vps-tc-limit.service"
+readonly INSTALL_PATH="/usr/local/sbin/vps-tc-limit"
+
+DEFAULT_INTERFACE="auto"
+DEFAULT_RATE="15mbit"
+DEFAULT_BURST="32kb"
+DEFAULT_LATENCY="400ms"
+
+log() { printf '[%s] %s\n' "$PROGRAM_NAME" "$*"; }
+warn() { printf '[%s] WARNING: %s\n' "$PROGRAM_NAME" "$*" >&2; }
+die() { printf '[%s] ERROR: %s\n' "$PROGRAM_NAME" "$*" >&2; exit 1; }
+
+require_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "This operation must be run as root."
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+detect_interface() {
+  local family route iface i
+  for family in -4 -6; do
+    route=$(ip "$family" route show default 2>/dev/null | head -n 1 || true)
+    [[ -n $route ]] || continue
+    read -ra fields <<< "$route"
+    for ((i = 0; i < ${#fields[@]}; i++)); do
+      if [[ ${fields[$i]} == "dev" && -n ${fields[$((i + 1))]:-} ]]; then
+        iface=${fields[$((i + 1))]}
+        [[ -e "/sys/class/net/$iface" ]] && { printf '%s\n' "$iface"; return 0; }
+      fi
+    done
+  done
+  return 1
+}
+
+valid_interface() {
+  [[ $1 =~ ^[a-zA-Z0-9_.:-]+$ && -e "/sys/class/net/$1" ]]
+}
+
+valid_rate() {
+  [[ ${1,,} =~ ^[0-9]+([.][0-9]+)?(kbit|mbit|gbit)$ ]]
+}
+
+valid_burst() {
+  [[ ${1,,} =~ ^[0-9]+([.][0-9]+)?(kb|mb|kbit|mbit)$ ]]
+}
+
+valid_latency() {
+  [[ ${1,,} =~ ^[0-9]+([.][0-9]+)?(us|ms|s)$ ]]
+}
+
+load_config() {
+  INTERFACE=$DEFAULT_INTERFACE
+  RATE=$DEFAULT_RATE
+  BURST=$DEFAULT_BURST
+  LATENCY=$DEFAULT_LATENCY
+
+  if [[ -f $CONFIG_FILE ]]; then
+    # The file is root-owned and written by this program. Only simple assignments are allowed.
+    while IFS='=' read -r key value; do
+      [[ $key =~ ^[[:space:]]*# || -z ${key//[[:space:]]/} ]] && continue
+      value=${value%$'\r'}
+      value=${value#\"}; value=${value%\"}
+      case $key in
+        INTERFACE) INTERFACE=$value ;;
+        RATE) RATE=$value ;;
+        BURST) BURST=$value ;;
+        LATENCY) LATENCY=$value ;;
+        *) warn "Ignoring unknown configuration key: $key" ;;
+      esac
+    done < "$CONFIG_FILE"
+  fi
+
+  valid_rate "$RATE" || die "Invalid RATE in $CONFIG_FILE: $RATE"
+  valid_burst "$BURST" || die "Invalid BURST in $CONFIG_FILE: $BURST"
+  valid_latency "$LATENCY" || die "Invalid LATENCY in $CONFIG_FILE: $LATENCY"
+
+  if [[ $INTERFACE == "auto" ]]; then
+    INTERFACE=$(detect_interface) || die "Unable to detect the default network interface."
+  fi
+  valid_interface "$INTERFACE" || die "Invalid or missing interface: $INTERFACE"
+}
+
+write_config() {
+  local interface=$1 rate=$2 burst=$3 latency=$4 tmp
+  tmp=$(mktemp)
+  chmod 600 "$tmp"
+  printf 'INTERFACE="%s"\nRATE="%s"\nBURST="%s"\nLATENCY="%s"\n' \
+    "$interface" "$rate" "$burst" "$latency" > "$tmp"
+  install -o root -g root -m 600 "$tmp" "$CONFIG_FILE"
+  rm -f "$tmp"
+  log "Configuration saved to $CONFIG_FILE"
+}
+
+start_limit() {
+  require_root
+  require_command ip
+  require_command tc
+  load_config
+
+  log "Applying $RATE outbound limit to $INTERFACE (burst $BURST, latency $LATENCY)..."
+  tc qdisc replace dev "$INTERFACE" root tbf rate "$RATE" burst "$BURST" latency "$LATENCY"
+  if tc qdisc show dev "$INTERFACE" | grep -qE '^qdisc tbf .* root'; then
+    log "Limit is active."
+  else
+    die "tc did not report an active TBF qdisc."
+  fi
+}
+
+stop_limit() {
+  require_root
+  require_command ip
+  require_command tc
+  load_config
+  if tc qdisc show dev "$INTERFACE" | grep -qE '^qdisc tbf .* root'; then
+    tc qdisc del dev "$INTERFACE" root
+    log "Limit removed from $INTERFACE; the kernel default qdisc is restored."
+  else
+    log "No TBF limit is active on $INTERFACE."
+  fi
+}
+
+show_status() {
+  require_command ip
+  require_command tc
+  load_config
+  printf 'Interface : %s\nConfigured: %s (burst %s, latency %s)\n' \
+    "$INTERFACE" "$RATE" "$BURST" "$LATENCY"
+  tc -s qdisc show dev "$INTERFACE"
+}
+
+configure() {
+  require_root
+  require_command tc
+  require_command ip
+  local detected interface rate burst latency answer old_interface=""
+  if [[ -f $CONFIG_FILE ]]; then
+    load_config
+    old_interface=$INTERFACE
+  fi
+  detected=$(detect_interface) || detected=""
+
+  printf 'Detected default interface: %s\n' "${detected:-not found}"
+  read -r -p "Interface [auto]: " interface
+  interface=${interface:-auto}
+  if [[ $interface != auto ]]; then
+    valid_interface "$interface" || die "Invalid or missing interface: $interface"
+  elif [[ -z $detected ]]; then
+    die "Automatic detection failed; specify an interface."
+  fi
+
+  read -r -p "Outbound rate [15mbit]: " rate
+  rate=${rate:-15mbit}
+  valid_rate "$rate" || die "Use a value such as 15000kbit, 15mbit, or 1gbit."
+
+  read -r -p "Burst [32kb]: " burst
+  burst=${burst:-32kb}
+  valid_burst "$burst" || die "Use a value such as 32kb or 1mb."
+
+  read -r -p "Queue latency [400ms]: " latency
+  latency=${latency:-400ms}
+  valid_latency "$latency" || die "Use a value such as 400ms or 1s."
+
+  write_config "$interface" "${rate,,}" "${burst,,}" "${latency,,}"
+  read -r -p "Apply the new limit now? [Y/n]: " answer
+  if [[ ! $answer =~ ^[Nn]$ ]]; then
+    if [[ -n $old_interface ]] && tc qdisc show dev "$old_interface" 2>/dev/null | grep -qE '^qdisc tbf .* root'; then
+      tc qdisc del dev "$old_interface" root
+      log "Removed the previous TBF rule from $old_interface."
+    fi
+    restart_limit
+  fi
+}
+
+restart_limit() {
+  require_root
+  if command -v systemctl >/dev/null 2>&1 && systemctl cat vps-tc-limit.service >/dev/null 2>&1; then
+    systemctl restart vps-tc-limit.service
+    log "Service restarted."
+  else
+    stop_limit || true
+    start_limit
+  fi
+}
+
+install_service() {
+  require_root
+  require_command install
+  require_command systemctl
+  require_command ip
+  require_command tc
+
+  install -o root -g root -m 755 "$0" "$INSTALL_PATH"
+  if [[ ! -f $CONFIG_FILE ]]; then
+    write_config "$DEFAULT_INTERFACE" "$DEFAULT_RATE" "$DEFAULT_BURST" "$DEFAULT_LATENCY"
+  fi
+
+  local tmp
+  tmp=$(mktemp)
+  chmod 600 "$tmp"
+  cat > "$tmp" <<'UNIT'
+[Unit]
+Description=Persistent VPS outbound bandwidth limiter
+Documentation=https://github.com/asd307769162/vps-tc-limit
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/vps-tc-limit start
+ExecStop=/usr/local/sbin/vps-tc-limit stop
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  install -o root -g root -m 644 "$tmp" "$SERVICE_FILE"
+  rm -f "$tmp"
+  systemctl daemon-reload
+  systemctl enable vps-tc-limit.service
+  log "Installed and enabled for boot. Run '$INSTALL_PATH configure' to change the rate."
+  systemctl restart vps-tc-limit.service
+}
+
+uninstall_service() {
+  require_root
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now vps-tc-limit.service 2>/dev/null || true
+  else
+    stop_limit || true
+  fi
+  rm -f "$SERVICE_FILE" "$INSTALL_PATH"
+  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload
+  log "Program and service removed. Configuration retained at $CONFIG_FILE."
+}
+
+print_help() {
+  cat <<EOF
+$PROGRAM_NAME $PROGRAM_VERSION
+
+Usage: $PROGRAM_NAME [command]
+
+Commands:
+  menu        Open the interactive menu (default)
+  start       Apply the configured outbound limit
+  stop        Remove the TBF limit
+  restart     Reapply the configured limit
+  status      Show configuration and tc statistics
+  configure   Set interface, rate, burst, and queue latency
+  install     Install the systemd service and enable it at boot
+  uninstall   Remove the service and executable; keep the config
+  version     Print version
+  help        Show this help
+
+Environment:
+  VPS_TC_CONFIG  Override the configuration path (mainly for testing)
+EOF
+}
+
+interactive_menu() {
+  local choice
+  while true; do
+    cat <<'MENU'
+
+VPS TC Limit
+1) Start limit
+2) Stop limit
+3) Restart limit
+4) Set limit speed
+5) Show status
+6) Install/enable at boot
+7) Uninstall service
+0) Exit
+MENU
+    read -r -p "Select: " choice
+    case $choice in
+      1) start_limit ;;
+      2) stop_limit ;;
+      3) restart_limit ;;
+      4) configure ;;
+      5) show_status ;;
+      6) install_service ;;
+      7) uninstall_service ;;
+      0) return 0 ;;
+      *) warn "Invalid selection." ;;
+    esac
+  done
+}
+
+main() {
+  case ${1:-menu} in
+    menu) interactive_menu ;;
+    start) start_limit ;;
+    stop) stop_limit ;;
+    restart) restart_limit ;;
+    status) show_status ;;
+    configure|config|set) configure ;;
+    install) install_service ;;
+    uninstall) uninstall_service ;;
+    version|--version|-V) printf '%s %s\n' "$PROGRAM_NAME" "$PROGRAM_VERSION" ;;
+    help|--help|-h) print_help ;;
+    *) print_help >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
